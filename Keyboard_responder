@@ -1,0 +1,420 @@
+// PS/2 Keyboard AA Detection with Response
+// Detects when keyboard sends 0xAA and responds with 0xFF
+
+#define DATA_PIN 2    // PS/2 Data line (use interrupt-capable pin)
+#define CLOCK_PIN 3   // PS/2 Clock line (use interrupt-capable pin)
+
+volatile int bit_count = 0;
+volatile unsigned int incoming_data = 0;
+volatile bool data_ready = false;
+volatile bool sending_data = false;
+
+// Variables for tracking break sequences
+bool expecting_break_code = false;
+unsigned long last_byte_time = 0;
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Set pins as inputs with pull-up resistors initially
+  pinMode(DATA_PIN, INPUT_PULLUP);
+  pinMode(CLOCK_PIN, INPUT_PULLUP);
+  
+  // Attach interrupt to clock pin (falling edge triggered)
+  attachInterrupt(digitalPinToInterrupt(CLOCK_PIN), ps2_interrupt, FALLING);
+  
+  Serial.println("PS/2 Keyboard AA Detector with Response Started");
+  Serial.println("Waiting for keyboard startup...");
+  Serial.println("Expected sequence: 0xAA (will respond with 0xFF)");
+  Serial.println("Also monitoring all keystrokes (Make/Break codes)");
+  Serial.println();
+}
+
+void loop() {
+  if (data_ready && !sending_data) {
+    data_ready = false;
+    
+    // Extract the 8 data bits (ignore start, parity, and stop bits)
+    unsigned char received_byte = (incoming_data >> 1) & 0xFF;
+    unsigned long current_time = millis();
+    
+    // Print timestamp and raw data
+    Serial.print("[");
+    Serial.print(current_time);
+    Serial.print("ms] Received: 0x");
+    if (received_byte < 16) Serial.print("0");
+    Serial.print(received_byte, HEX);
+    Serial.print(" (");
+    Serial.print(received_byte);
+    Serial.print(") ");
+    
+    // Check if it's the AA signal first
+    if (received_byte == 0xAA) {
+      Serial.println("<-- KEYBOARD SELF-TEST PASSED (AA)!");
+      Serial.println("*** Responding with 0xFF ***");
+      
+      // Send 0xFF response to keyboard
+      sendByteToKeyboard(0xFF);
+    } 
+    // Interpret other scan codes
+    else if (received_byte == 0xF0) {
+      Serial.println("← BREAK PREFIX (key will be released)");
+      expecting_break_code = true;
+    } else if (expecting_break_code) {
+      Serial.print("← BREAK CODE (key 0x");
+      if (received_byte < 16) Serial.print("0");
+      Serial.print(received_byte, HEX);
+      Serial.print(" released)");
+      
+      // Show key name if known
+      printKeyName(received_byte);
+      Serial.println();
+      
+      expecting_break_code = false;
+    } else {
+      Serial.print("← MAKE CODE (key 0x");
+      if (received_byte < 16) Serial.print("0");
+      Serial.print(received_byte, HEX);
+      Serial.print(" pressed)");
+      
+      // Show key name if known
+      printKeyName(received_byte);
+      Serial.println();
+    }
+    
+    // Show time between bytes for break sequences
+    if (last_byte_time > 0 && (expecting_break_code || received_byte == 0xF0)) {
+      unsigned long time_diff = current_time - last_byte_time;
+      Serial.print("    (");
+      Serial.print(time_diff);
+      Serial.println("ms since last byte)");
+    }
+    last_byte_time = current_time;
+    
+    // Reset for next byte
+    bit_count = 0;
+    incoming_data = 0;
+  }
+  
+  // Reduced delay to catch rapid sequences
+  delay(1);
+}
+
+void ps2_interrupt() {
+  // Don't process interrupts while we're sending data
+  if (sending_data) {
+    return;
+  }
+  
+  // Read the data line
+  int data_bit = digitalRead(DATA_PIN);
+  
+  // Store the bit in our data buffer
+  incoming_data = incoming_data | (data_bit << bit_count);
+  bit_count++;
+  
+  // PS/2 sends 11 bits total: start(0) + 8 data + parity + stop(1)
+  if (bit_count >= 11) {
+    data_ready = true;
+  }
+}
+
+void sendByteToKeyboard(unsigned char data_byte) {
+  sending_data = true;
+  
+  // Disable interrupts during transmission
+  detachInterrupt(digitalPinToInterrupt(CLOCK_PIN));
+  
+  // Step 1: Pull clock low and wait 100+ microseconds
+  pinMode(CLOCK_PIN, OUTPUT);
+  digitalWrite(CLOCK_PIN, LOW);
+  delayMicroseconds(150);
+  
+  // Step 2: Pull data low (start bit) and release clock
+  pinMode(DATA_PIN, OUTPUT);
+  digitalWrite(DATA_PIN, LOW);  // Start bit = 0
+  pinMode(CLOCK_PIN, INPUT_PULLUP);  // Release clock
+  
+  // Calculate parity (odd parity)
+  unsigned char parity = 1;
+  for (int i = 0; i < 8; i++) {
+    if (data_byte & (1 << i)) {
+      parity ^= 1;
+    }
+  }
+  
+  // Wait for keyboard to start clocking
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    delayMicroseconds(10);
+  }
+  
+  // Send 8 data bits
+  for (int i = 0; i < 8; i++) {
+    // Wait for clock to go low
+    while (digitalRead(CLOCK_PIN) != LOW) {
+      delayMicroseconds(10);
+    }
+    
+    // Set data bit
+    if (data_byte & (1 << i)) {
+      digitalWrite(DATA_PIN, HIGH);
+    } else {
+      digitalWrite(DATA_PIN, LOW);
+    }
+    
+    // Wait for clock to go high
+    while (digitalRead(CLOCK_PIN) != HIGH) {
+      delayMicroseconds(10);
+    }
+  }
+  
+  // Send parity bit
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    delayMicroseconds(10);
+  }
+  digitalWrite(DATA_PIN, parity ? HIGH : LOW);
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    delayMicroseconds(10);
+  }
+  
+  // Send stop bit (release data line)
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    delayMicroseconds(10);
+  }
+  pinMode(DATA_PIN, INPUT_PULLUP);  // Release data line (stop bit = 1)
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    delayMicroseconds(10);
+  }
+  
+  // Wait for ACK bit from keyboard
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    delayMicroseconds(10);
+  }
+  
+  // Check ACK (should be low)
+  delayMicroseconds(25);  // Sample in middle of bit time
+  bool ack = digitalRead(DATA_PIN);
+  
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    delayMicroseconds(10);
+  }
+  
+  if (!ack) {
+    Serial.println("Keyboard ACK received - transmission successful!");
+  } else {
+    Serial.println("Keyboard NACK received - transmission may have failed");
+  }
+  
+  // Small delay before re-enabling reception
+  delay(10);
+  
+  // Re-enable interrupts for reception
+  attachInterrupt(digitalPinToInterrupt(CLOCK_PIN), ps2_interrupt, FALLING);
+  sending_data = false;
+  
+  Serial.println("Ready to receive again...");
+}
+
+// Function to print key names for common scan codes
+void printKeyName(unsigned char scan_code) {
+  switch (scan_code) {
+    case 0x29: Serial.print(" [SPACEBAR]"); break;
+    case 0x1C: Serial.print(" [A]"); break;
+    case 0x32: Serial.print(" [B]"); break;
+    case 0x21: Serial.print(" [C]"); break;
+    case 0x23: Serial.print(" [D]"); break;
+    case 0x24: Serial.print(" [E]"); break;
+    case 0x2B: Serial.print(" [F]"); break;
+    case 0x34: Serial.print(" [G]"); break;
+    case 0x33: Serial.print(" [H]"); break;
+    case 0x43: Serial.print(" [I]"); break;
+    case 0x3B: Serial.print(" [J]"); break;
+    case 0x42: Serial.print(" [K]"); break;
+    case 0x4B: Serial.print(" [L]"); break;
+    case 0x3A: Serial.print(" [M]"); break;
+    case 0x31: Serial.print(" [N]"); break;
+    case 0x44: Serial.print(" [O]"); break;
+    case 0x4D: Serial.print(" [P]"); break;
+    case 0x15: Serial.print(" [Q]"); break;
+    case 0x2D: Serial.print(" [R]"); break;
+    case 0x1B: Serial.print(" [S]"); break;
+    case 0x2C: Serial.print(" [T]"); break;
+    case 0x3C: Serial.print(" [U]"); break;
+    case 0x2A: Serial.print(" [V]"); break;
+    case 0x1D: Serial.print(" [W]"); break;
+    case 0x22: Serial.print(" [X]"); break;
+    case 0x35: Serial.print(" [Y]"); break;
+    case 0x1A: Serial.print(" [Z]"); break;
+    case 0x16: Serial.print(" [1]"); break;
+    case 0x1E: Serial.print(" [2]"); break;
+    case 0x26: Serial.print(" [3]"); break;
+    case 0x25: Serial.print(" [4]"); break;
+    case 0x2E: Serial.print(" [5]"); break;
+    case 0x36: Serial.print(" [6]"); break;
+    case 0x3D: Serial.print(" [7]"); break;
+    case 0x3E: Serial.print(" [8]"); break;
+    case 0x46: Serial.print(" [9]"); break;
+    case 0x45: Serial.print(" [0]"); break;
+    case 0x5A: Serial.print(" [ENTER]"); break;
+    case 0x76: Serial.print(" [ESC]"); break;
+    case 0x66: Serial.print(" [BACKSPACE]"); break;
+    case 0x0D: Serial.print(" [TAB]"); break;
+    case 0x12: Serial.print(" [LEFT SHIFT]"); break;
+    case 0x59: Serial.print(" [RIGHT SHIFT]"); break;
+    case 0x14: Serial.print(" [LEFT CTRL]"); break;
+    case 0x11: Serial.print(" [LEFT ALT]"); break;
+    case 0x58: Serial.print(" [CAPS LOCK]"); break;
+    case 0x77: Serial.print(" [NUM LOCK]"); break;
+    case 0x7E: Serial.print(" [SCROLL LOCK]"); break;
+    default: break;
+  }
+}
+
+// Timeout version of sendByteToKeyboard for better error handling
+void sendByteToKeyboardWithTimeout(unsigned char data_byte) {
+  sending_data = true;
+  unsigned long timeout_start;
+  const unsigned long TIMEOUT_MS = 100;
+  
+  // Disable interrupts during transmission
+  detachInterrupt(digitalPinToInterrupt(CLOCK_PIN));
+  
+  // Step 1: Pull clock low and wait 100+ microseconds
+  pinMode(CLOCK_PIN, OUTPUT);
+  digitalWrite(CLOCK_PIN, LOW);
+  delayMicroseconds(150);
+  
+  // Step 2: Pull data low (start bit) and release clock
+  pinMode(DATA_PIN, OUTPUT);
+  digitalWrite(DATA_PIN, LOW);  // Start bit = 0
+  pinMode(CLOCK_PIN, INPUT_PULLUP);  // Release clock
+  
+  // Calculate parity (odd parity)
+  unsigned char parity = 1;
+  for (int i = 0; i < 8; i++) {
+    if (data_byte & (1 << i)) {
+      parity ^= 1;
+    }
+  }
+  
+  // Wait for keyboard to start clocking with timeout
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout waiting for clock high - aborting transmission");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  
+  // Send 8 data bits with timeout checks
+  for (int i = 0; i < 8; i++) {
+    // Wait for clock to go low
+    timeout_start = millis();
+    while (digitalRead(CLOCK_PIN) != LOW) {
+      if (millis() - timeout_start > TIMEOUT_MS) {
+        Serial.println("Timeout during data transmission - aborting");
+        goto cleanup;
+      }
+      delayMicroseconds(10);
+    }
+    
+    // Set data bit
+    if (data_byte & (1 << i)) {
+      digitalWrite(DATA_PIN, HIGH);
+    } else {
+      digitalWrite(DATA_PIN, LOW);
+    }
+    
+    // Wait for clock to go high
+    timeout_start = millis();
+    while (digitalRead(CLOCK_PIN) != HIGH) {
+      if (millis() - timeout_start > TIMEOUT_MS) {
+        Serial.println("Timeout during data transmission - aborting");
+        goto cleanup;
+      }
+      delayMicroseconds(10);
+    }
+  }
+  
+  // Send parity bit
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout sending parity - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  digitalWrite(DATA_PIN, parity ? HIGH : LOW);
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout sending parity - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  
+  // Send stop bit (release data line)
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout sending stop bit - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  pinMode(DATA_PIN, INPUT_PULLUP);  // Release data line (stop bit = 1)
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout sending stop bit - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  
+  // Wait for ACK bit from keyboard
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != LOW) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout waiting for ACK - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  
+  // Check ACK (should be low)
+  delayMicroseconds(25);  // Sample in middle of bit time
+  bool ack = digitalRead(DATA_PIN);
+  
+  timeout_start = millis();
+  while (digitalRead(CLOCK_PIN) != HIGH) {
+    if (millis() - timeout_start > TIMEOUT_MS) {
+      Serial.println("Timeout during ACK - aborting");
+      goto cleanup;
+    }
+    delayMicroseconds(10);
+  }
+  
+  if (!ack) {
+    Serial.println("Keyboard ACK received - transmission successful!");
+  } else {
+    Serial.println("Keyboard NACK received - transmission may have failed");
+  }
+
+cleanup:
+  // Ensure pins are back to input mode
+  pinMode(DATA_PIN, INPUT_PULLUP);
+  pinMode(CLOCK_PIN, INPUT_PULLUP);
+  
+  // Small delay before re-enabling reception
+  delay(10);
+  
+  // Re-enable interrupts for reception
+  attachInterrupt(digitalPinToInterrupt(CLOCK_PIN), ps2_interrupt, FALLING);
+  sending_data = false;
+  
+  Serial.println("Ready to receive again...");
+}
